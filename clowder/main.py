@@ -4,8 +4,9 @@ from clowder.investigations import Investigations
 
 
 def main():
-    invs = Investigations()
-    inv = invs.get_investigation("1vqj5NAhQFufODAbU94h50upfwbjRfml-")
+    investigations = Investigations()
+    investigation = investigations.get_investigation("17Hk0tmveLWqLnJH-qMeqyU7cUepZKUQW")
+    investigation.setup_investigation()
 
 
 if __name__ == "__main__":
