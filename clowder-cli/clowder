@@ -1,0 +1,82 @@
+#! /bin/python
+
+import sys
+import os
+from pathlib import Path
+
+sys.path.append(str(Path(os.curdir).parent.absolute().parent.absolute()))
+from typing import Optional
+import typer
+from rich import print
+from clowder import functions
+
+app = typer.Typer()
+
+
+@app.command("untrack")
+def untrack(investigation_name: Optional[str] = None, inactive_only: bool = False):
+    print(functions.untrack(investigation_name, inactive_only))
+
+
+@app.command("track")
+def track(investigation_name: Optional[str] = None, active_only: bool = False):
+    print(functions.track(investigation_name, active_only))
+
+
+@app.command("duplicate")
+def duplicate(from_investigation_name: str, new_investigation_name: str):
+    print(functions.duplicate(from_investigation_name, new_investigation_name))
+
+
+@app.command("delete")
+def delete(investigation_name: str, keep_clearml: bool = False, keep_google_drive: bool = False):
+    print(functions.delete(investigation_name, not keep_clearml, not keep_google_drive))
+
+
+@app.command("urlfor")
+def urlfor(investigation_name: str):
+    print(functions.urlfor(investigation_name))
+
+
+@app.command("cancel")
+def cancel(investigation_name: Optional[str] = None, only_if_pending: bool = False):
+    print(functions.cancel(investigation_name))
+
+
+@app.command("run")
+def run(investigation_name: Optional[str] = None, force_rerun: bool = False):
+    print(functions.run(investigation_name, force_rerun))
+
+
+@app.command("status")
+def status(investigation_name: Optional[str] = None, sync: bool = True):
+    print(functions.status(investigation_name, sync))
+
+
+@app.command("sync")
+def sync(investigation_name: Optional[str] = None, polling_interval_minutes: int = 0):
+    print(functions.sync(investigation_name, polling_interval_minutes))
+
+
+@app.command("create")
+def create(investigation_path: str):
+    print(functions.create(investigation_path))
+
+
+@app.command("use-context")
+def use_context(root_folder_id: str):
+    print(functions.use_context(root_folder_id))
+
+
+@app.command("list")
+def list():
+    print(functions.list())
+
+
+@app.command("current-context")
+def current_context():
+    print(functions.current_context())
+
+
+if __name__ == "__main__":
+    app()

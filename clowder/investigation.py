@@ -7,7 +7,7 @@ from jinja2 import BaseLoader, Environment
 
 from clowder.environment import ENV
 
-EXPERIMENT_PARAMETER_SPREADSHEET = "experiment_parameters"
+EXPERIMENT_PARAMETER_SPREADSHEET = "investigation-parameters"
 EXPERIMENT_FOLDER = "experiments"
 
 
@@ -43,7 +43,6 @@ class Investigation:
     def _check_silnlp_jobs(self):
         self.silnlp_config_yml = ""
         if (self.experiments_df["type"] == "silnlp").sum() == 0:
-            print("No silnlp jobs")
             return
         if self.experiments_df.index.duplicated().sum() > 0:
             raise MissingConfigurationFile(
@@ -64,7 +63,6 @@ class Investigation:
                 self._setup_silnlp_experiment(str(name), params, experiment_folder_id)
             else:
                 raise NotImplementedError(f"Experiment type {params['type']} not implemented")
-            print(f"Setup experiment {name}")
         self._copy_gdrive_folder_to_s3(experiments_folder_id, self.investigation_s3_path)
 
     def _setup_silnlp_experiment(self, name: str, params: pd.Series, folder_id: str):
@@ -73,7 +71,7 @@ class Investigation:
         ENV.write_gdrive_file_in_folder(folder_id, "config.yml", rendered_config)
 
     def _copy_gdrive_folder_to_s3(self, folder_id: str, s3_path: s3path.S3Path):
-        print(f"Copying folder {folder_id} to {s3_path}")
+        # print(f"Copying folder {folder_id} to {s3_path}")
         for file in ENV.list_gdrive_files(folder_id):
             s3_file = s3_path / file["title"]
             if file["mimeType"] == "application/vnd.google-apps.folder":
