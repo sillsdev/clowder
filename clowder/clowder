@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 sys.path.append(str(Path(os.curdir).parent.absolute().parent.absolute()))
+
 from typing import Optional
 import typer
 from rich import print
@@ -38,13 +39,18 @@ def urlfor(investigation_name: str):
     print(functions.urlfor(investigation_name))
 
 
+@app.command("idfor")
+def idfor(investigation_name: str):
+    print(functions.idfor(investigation_name))
+
+
 @app.command("cancel")
 def cancel(investigation_name: Optional[str] = None, only_if_pending: bool = False):
     print(functions.cancel(investigation_name))
 
 
 @app.command("run")
-def run(investigation_name: Optional[str] = None, force_rerun: bool = False):
+def run(investigation_name: str, force_rerun: bool = False):
     print(functions.run(investigation_name, force_rerun))
 
 
@@ -54,8 +60,8 @@ def status(investigation_name: Optional[str] = None, sync: bool = True):
 
 
 @app.command("sync")
-def sync(investigation_name: Optional[str] = None, polling_interval_minutes: int = 0):
-    print(functions.sync(investigation_name, polling_interval_minutes))
+def sync(investigation_name: Optional[str] = None):  # TODO , polling_interval_minutes: int = 0
+    print(functions.sync(investigation_name))
 
 
 @app.command("create")
@@ -70,7 +76,7 @@ def use_context(root_folder_id: str):
 
 @app.command("list")
 def list():
-    print(functions.list())
+    print(functions.list_inv())
 
 
 @app.command("current-context")

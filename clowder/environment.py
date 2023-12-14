@@ -5,6 +5,8 @@ import yaml
 import warnings
 from pathlib import Path
 import gspread
+from clearml import Task
+from clearml.backend_api.session.session import LoginError
 
 warnings.filterwarnings("ignore", r"Blowfish")
 
@@ -40,7 +42,9 @@ class Environment:
             else "../.clowder/"
             + list(filter(lambda p: "clowder" in p and ".json" in p, os.listdir("../.clowder/")))[0]  # TODO
         )
-        self.EXPERIMENTS_S3_FOLDER = "clowder"  # self._get_env_var("EXPERIMENTS_S3_FOLDER")
+        self.EXPERIMENTS_S3_FOLDER = (
+            "/aqua-ml-data/MT/experiments/clowder/"  # self._get_env_var("EXPERIMENTS_S3_FOLDER")
+        )
         self._setup_google_drive()
         self._existing_files: dict[str, dict[str, GoogleDriveFile]] = {}
         self.gc = gspread.service_account(filename=Path(self.GOOGLE_CREDENTIALS_FILE))
@@ -87,7 +91,6 @@ class Environment:
 
     def read_gdrive_file_as_bytes(self, file_id: str) -> bytes:
         file = self._google_drive.CreateFile({"id": file_id})
-        in_memory_file = io.BytesIO()
         buffer: MediaIoReadable = file.GetContentIOBuffer()
         return buffer.read()  # type: ignore
 
@@ -131,6 +134,16 @@ class Environment:
         )
         fh.Upload()
         return fh["id"]
+
+    def sync_clearml_tasks(self, investigation_name: str):
+        if "experiments" not in self.current_meta["investigations"][investigation_name]:
+            self.current_meta["investigations"][investigation_name]["experiments"] = {}
+        experiments = self.current_meta["investigations"][investigation_name]["experiments"]
+        tasks = {}
+        for experiment_name, obj in experiments.items():
+            task: Optional[Task] = Task.get_task(task_id=obj["clearml_id"])
+            tasks[experiment_name] = task
+        return tasks
 
 
 ENV = Environment()

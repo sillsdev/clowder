@@ -1,14 +1,16 @@
 from pathlib import Path
-
+import subprocess
 import gspread
 import pandas as pd
 import s3path
+import re
 from jinja2 import BaseLoader, Environment
 
 from clowder.environment import ENV
 
-EXPERIMENT_PARAMETER_SPREADSHEET = "investigation-parameters"
+EXPERIMENT_PARAMETER_SPREADSHEET = "investigation"
 EXPERIMENT_FOLDER = "experiments"
+CLEARML_QUEUE = "lambert_24gb"
 
 
 class MissingConfigurationFile(IOError):
@@ -17,9 +19,10 @@ class MissingConfigurationFile(IOError):
 
 
 class Investigation:
-    def __init__(self, folder_id: str):
+    def __init__(self, folder_id: str, name: str):
         self.folder_id = folder_id
-        self.gc = gspread.service_account(filename=Path(ENV.GOOGLE_CREDENTIALS_FILE))
+        self.name = name
+        self.gc = gspread.service_account(filename=Path(ENV.GOOGLE_CREDENTIALS_FILE))  # type: ignore
         self._import_experiments_spreadsheet()
         self._check_silnlp_jobs()
         self._setup_experiment_s3()
@@ -42,8 +45,8 @@ class Investigation:
 
     def _check_silnlp_jobs(self):
         self.silnlp_config_yml = ""
-        if (self.experiments_df["type"] == "silnlp").sum() == 0:
-            return
+        # if (self.experiments_df["type"] == "silnlp").sum() == 0: #TODO support other broad types of jobs?
+        #     return
         if self.experiments_df.index.duplicated().sum() > 0:
             raise MissingConfigurationFile(
                 "Duplicate names in experiments google sheet.  Each name needs to be unique."
@@ -59,14 +62,13 @@ class Investigation:
         experiments_folder_id = ENV.create_gdrive_folder(EXPERIMENT_FOLDER, self.folder_id)
         for name, params in self.experiments_df.iterrows():
             experiment_folder_id = ENV.create_gdrive_folder(str(name), experiments_folder_id)
-            if params["type"] == "silnlp":
-                self._setup_silnlp_experiment(str(name), params, experiment_folder_id)
-            else:
-                raise NotImplementedError(f"Experiment type {params['type']} not implemented")
+            self._setup_silnlp_experiment(
+                str(name), params, experiment_folder_id
+            )  # TODO only silnlp jobs for now - or assumes similar setup
         self._copy_gdrive_folder_to_s3(experiments_folder_id, self.investigation_s3_path)
 
     def _setup_silnlp_experiment(self, name: str, params: pd.Series, folder_id: str):
-        rtemplate = Environment(loader=BaseLoader()).from_string(self.silnlp_config_yml)
+        rtemplate = Environment(loader=BaseLoader()).from_string(self.silnlp_config_yml)  # TODO iterate across types
         rendered_config = rtemplate.render(params.to_dict())
         ENV.write_gdrive_file_in_folder(folder_id, "config.yml", rendered_config)
 
@@ -79,3 +81,21 @@ class Investigation:
             else:
                 with s3_file.open("wb") as f:
                     f.write(ENV.read_gdrive_file_as_bytes(file["id"]))
+
+    def start_investigation(self):
+        if "experiments" not in ENV.current_meta["investigations"][self.name]:
+            ENV.current_meta["investigations"][self.name]["experiments"] = {}
+        worksheet: gspread.Spreadsheet = self.gc.open_by_key(self.files[EXPERIMENT_PARAMETER_SPREADSHEET]["id"])
+        paramters_df: pd.DataFrame = pd.DataFrame(worksheet.sheet1.get_all_records())
+        for _, row in paramters_df.iterrows():
+            experiment_path: s3path.S3Path = self.investigation_s3_path / row["name"]
+            result = subprocess.run(
+                f"python -m {row['entrypoint']} --clearml-queue {CLEARML_QUEUE} {'/'.join(str(experiment_path.absolute()).split('/')[4:])}",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            print(result.stdout)
+            match = re.search(r"new task id=(.*)", result.stdout)
+            clearml_id = match.group(1) if match is not None else "unknown"
+            ENV.current_meta["investigations"][self.name]["experiments"][row["name"]] = {"clearml_id": clearml_id}
