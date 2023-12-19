@@ -10,7 +10,7 @@ class Status(Enum):
     Completed = "Completed"
 
     @staticmethod
-    def from_clearml_tasks_status(statuses: "list[Task.TaskStatusEnum]", current_status):
+    def from_clearml_task_statuses(statuses: "list[Task.TaskStatusEnum]", current_status: Enum) -> Enum:
         # "created", "in_progress", "stopped", "closed", "failed", "completed", "queued", "published", "publishing", "unknown"
         if len(statuses) == 0:
             return current_status
