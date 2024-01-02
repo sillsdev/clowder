@@ -10,18 +10,19 @@ from typing import Optional
 import typer
 from rich import print
 from clowder import functions
+from clowder.status import Status
 
 app = typer.Typer()
 
 
 @app.command("untrack")
-def untrack(investigation_name: Optional[str] = None, inactive_only: bool = False):
-    print(functions.untrack(investigation_name, inactive_only))
+def untrack(investigation_name: str):
+    print(functions.untrack(investigation_name))
 
 
 @app.command("track")
-def track(investigation_name: Optional[str] = None, active_only: bool = False):
-    print(functions.track(investigation_name, active_only))
+def track(investigation_name: Optional[str] = None):
+    print(functions.track(investigation_name))
 
 
 @app.command("duplicate")
@@ -45,7 +46,7 @@ def idfor(investigation_name: str):
 
 
 @app.command("cancel")
-def cancel(investigation_name: Optional[str] = None, only_if_pending: bool = False):
+def cancel(investigation_name: str):
     print(functions.cancel(investigation_name))
 
 
@@ -56,32 +57,55 @@ def run(investigation_name: str, force_rerun: bool = False):
 
 @app.command("status")
 def status(investigation_name: Optional[str] = None, sync: bool = True):
-    print(functions.status(investigation_name, sync))
+    for inv_name, status in functions.status(investigation_name, sync).items():
+        color = _map_status_color(status)
+        print(inv_name, f"[{color}]{status.value}[/{color}]")
 
 
 @app.command("sync")
-def sync(investigation_name: Optional[str] = None):  # TODO , polling_interval_minutes: int = 0
-    print(functions.sync(investigation_name))
+def sync(investigation_name: Optional[str] = None):
+    functions.sync(investigation_name)
+    print(
+        f"[green]Successfully synced {investigation_name if investigation_name else 'all investigations in this context'}[/green]"
+    )
 
 
 @app.command("create")
-def create(investigation_path: str):
-    print(functions.create(investigation_path))
+def create(investigation_name: str):
+    functions.create(investigation_name)
+    print(f"[green]Investigation {investigation_name} successfully created")
 
 
 @app.command("use-context")
 def use_context(root_folder_id: str):
-    print(functions.use_context(root_folder_id))
+    functions.use_context(root_folder_id)
+    print(f"[green]Success! Now using context {root_folder_id}[/green]")
 
 
 @app.command("list")
 def list():
-    print(functions.list_inv())
+    for inv in functions.list_inv():
+        print(inv.name)
 
 
 @app.command("current-context")
 def current_context():
     print(functions.current_context())
+
+
+def _map_status_color(status: Status) -> str:
+    # Mysterious comparison behavior; comparing by value instead
+    if status.value == Status.Created.value:
+        return "blue"
+    if status.value == Status.Running.value:
+        return "yellow"
+    if status.value == Status.Completed.value:
+        return "green"
+    if status.value == Status.Canceled.value:
+        return "pink"
+    if status.value == Status.Failed.value:
+        return "red"
+    return "white"
 
 
 if __name__ == "__main__":

@@ -14,10 +14,10 @@ class Status(Enum):
         # "created", "in_progress", "stopped", "closed", "failed", "completed", "queued", "published", "publishing", "unknown"
         if len(statuses) == 0:
             return current_status
-        if len(list(filter(lambda s: s == "Completed", statuses))) == len(statuses):
+        if len(list(filter(lambda s: s == Task.TaskStatusEnum.completed, statuses))) == len(statuses):
             return Status.Completed
-        if len(list(filter(lambda s: s == "Canceled", statuses))) == len(statuses):
+        if len(list(filter(lambda s: s == Task.TaskStatusEnum.stopped, statuses))) == len(statuses):
             return Status.Canceled
-        if len(list(filter(lambda s: s == "Failed", statuses))) > 0:
+        if len(list(filter(lambda s: s == Task.TaskStatusEnum.failed, statuses))) > 0:
             return Status.Failed
         return current_status
