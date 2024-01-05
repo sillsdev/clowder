@@ -1,5 +1,5 @@
 from typing import Optional
-from clowder.environment import ENV, Investigation
+from clowder.environment import ENV, Investigation, DuplicateExperimentException
 from clowder.status import Status
 import yaml
 
@@ -8,7 +8,7 @@ import yaml
 
 
 def untrack(investigation_name: str):
-    ENV.get_investigation(investigation_name).delete(delete_from_clearml=False, delete_from_gdrive=False)  # type: ignore
+    ENV.get_investigation(investigation_name).delete(delete_from_clearml=False, delete_from_gdrive=False, delete_from_s3=False)  # type: ignore
 
 
 def track(investigation_name: Optional[str]):
@@ -16,20 +16,32 @@ def track(investigation_name: Optional[str]):
         ENV.track_investigation_by_name(investigation_name)
     else:
         ENV.track_all_investigations()
+    sync(investigation_name)
 
 
-def duplicate(from_investigation_name: str, new_investigation_name: str):
-    create(new_investigation_name)
-    # ... Copy contents in gdrive
+def create_from_template(from_investigation_name: str, new_investigation_name: str):
     try:
-        # TODO duplicate
+        old_investigation = ENV.get_investigation(from_investigation_name)
+        create(new_investigation_name)
+        new_investigation = ENV.get_investigation(new_investigation_name)
+        new_investigation.import_setup_from(old_investigation)
+        pass
+    except DuplicateExperimentException:
         pass
     except:
         delete(new_investigation_name)
+    raise DuplicateExperimentException(
+        f"Investigation with name {from_investigation_name} already exists in the current context"
+    )
 
 
-def delete(investigation_name: str, delete_from_clearml: bool = True, delete_from_google_drive: bool = True):
-    ENV.get_investigation(investigation_name).delete(delete_from_clearml, delete_from_google_drive)
+def delete(
+    investigation_name: str,
+    delete_from_clearml: bool = True,
+    delete_from_google_drive: bool = True,
+    delete_from_s3: bool = True,
+):
+    ENV.get_investigation(investigation_name).delete(delete_from_clearml, delete_from_google_drive, delete_from_s3)
 
 
 def idfor(investigation_name: str) -> str:
@@ -47,37 +59,43 @@ def cancel(investigation_name: str):
 
 
 def run(investigation_name: str, force_rerun: bool = False) -> bool:
-    sync(investigation_name)
-
+    sync(investigation_name, aggregate_results=False)
     investigation = ENV.get_investigation(investigation_name)
-    if investigation.status == Status.Running:
-        return False
-    elif not force_rerun and investigation.status.value == Status.Completed.value:
+    if investigation.status.value == Status.Running.value:
         return False
     investigation.setup()
     now_running = investigation.start_investigation(force_rerun)
     if now_running:
         investigation.status = Status.Running
     sync(investigation_name)
-    return True
+    return now_running
 
 
-def status(investigation_name: Optional[str], _sync: bool = True) -> "dict[str, Status]":
+def status(investigation_name: Optional[str], _sync: bool = True) -> dict:
     """Returns status of investigation with name `investigation_name` in the current context"""
     if _sync:
         sync(investigation_name)
     if investigation_name is not None:
         if ENV.investigation_exists(investigation_name):
-            return {investigation_name: ENV.get_investigation(investigation_name).status}
-    return {inv.name: inv.status for inv in ENV.investigations}
+            return {
+                investigation_name: {
+                    "status": ENV.get_investigation(investigation_name).status,
+                    "experiments": ENV.get_investigation(investigation_name).experiments,
+                    "gdrive_url": urlfor(investigation_name),
+                }
+            }
+    return {
+        inv.name: {"status": inv.status, "experiments": inv.experiments, "gdrive_url": urlfor(inv.name)}
+        for inv in ENV.investigations
+    }
 
 
-def sync(investigation_name: Optional[str]):
+def sync(investigation_name: Optional[str], aggregate_results: bool = True):
     if investigation_name is not None:
-        ENV.get_investigation(investigation_name).sync()
+        ENV.get_investigation(investigation_name).sync(aggregate_results=aggregate_results)
     else:
         for investigation in ENV.investigations:
-            investigation.sync()
+            investigation.sync(aggregate_results=aggregate_results)
 
 
 def create(investigation_name: str):
@@ -100,3 +118,8 @@ def list_inv() -> "list[Investigation]":
 
 def current_context() -> str:
     return ENV.root
+
+
+def init():
+    ENV.meta.data = {"temp": {"investigations": {}}, "current_root": "temp"}
+    ENV.meta.flush()

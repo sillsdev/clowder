@@ -4,7 +4,7 @@ warnings.filterwarnings("ignore", r"Blowfish")
 
 import os
 import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from pathlib import Path
 import gspread
 from clearml import Task
@@ -25,9 +25,16 @@ import numpy as np
 from gspread import Worksheet
 import gspread_dataframe as gd
 from status import Status
+from pprint import pprint
+from time import sleep
 
 GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
-CLEARML_QUEUE = "lambert_24gb"
+CLEARML_QUEUE = "jobs_backlog"
+CLEARML_URL = "app.sil.hosted.allegro.ai"
+RESULTS_CSVS_ATTRIBUTE = "results-csvs"
+RESULTS_CLEARML_METRIC_ATTRIBUTE = "results-clearml-metrics"
+ENTRYPOINT_ATTRIBUTE = "entrypoint"
+NAME_ATTRIBUTE = "name"
 
 
 class MissingConfigurationFile(IOError):
@@ -60,6 +67,7 @@ class Investigation:
         self.sheet_id = sheet_id
         self.log_id = log_id
         self._status: Status = Status(status)
+        self.investigation_s3_path = s3path.S3Path(ENV.EXPERIMENTS_S3_FOLDER) / (self.name + "_" + self.id)
 
     @property
     def status(self):
@@ -71,12 +79,16 @@ class Investigation:
         ENV.meta.flush()
         self._status = enum
 
+    @property
+    def experiments(self):
+        return ENV.current_meta["investigations"][self.name]["experiments"]
+
     def _get_experiments_df(self):
         worksheet: gspread.Spreadsheet = ENV.gc.open_by_key(self.sheet_id)
         experiments_df: pd.DataFrame = pd.DataFrame(worksheet.sheet1.get_all_records())
-        if "name" not in experiments_df.columns:
+        if NAME_ATTRIBUTE not in experiments_df.columns:
             raise MissingConfigurationFile("Missing name column in ExperimentsSetup sheet")
-        if "entrypoint" not in experiments_df.columns:
+        if ENTRYPOINT_ATTRIBUTE not in experiments_df.columns:
             raise MissingConfigurationFile("Missing entrypoint column in ExperimentsSetup sheet")
         experiments_df.set_index(experiments_df.name, inplace=True)
         if experiments_df.index.duplicated().sum() > 0:
@@ -87,7 +99,6 @@ class Investigation:
 
     def setup(self):
         experiments_df = self._get_experiments_df()
-        self.investigation_s3_path = s3path.S3Path(ENV.EXPERIMENTS_S3_FOLDER) / self.id
         self.experiments_folder_id = ENV._create_gdrive_folder("experiments", self.id)
         ENV.current_meta["investigations"][self.name]["experiments_folder_id"] = self.experiments_folder_id
         ENV.meta.flush()
@@ -98,32 +109,38 @@ class Investigation:
 
     def _setup_experiment(self, params: pd.Series, folder_id: str):
         files = ENV._dict_of_gdrive_files(self.id)
+        # print(params, folder_id)
         silnlp_config_yml = ENV._read_gdrive_file_as_string(files["config.yml"]["id"])  # TODO save config? Per type?
         rtemplate = jinja2.Environment(loader=jinja2.BaseLoader()).from_string(silnlp_config_yml)
         rendered_config = rtemplate.render(params.to_dict())
+        # print(rendered_config)
         ENV._write_gdrive_file_in_folder(folder_id, "config.yml", rendered_config)
 
     def start_investigation(self, force_rerun: bool = False) -> bool:
-        if "experiments" not in ENV.current_meta["investigations"][self.name]:
-            ENV.current_meta["investigations"][self.name]["experiments"] = {}
-        worksheet: gspread.Spreadsheet = ENV.gc.open_by_key(self.sheet_id)
-        paramters_df: pd.DataFrame = pd.DataFrame(worksheet.sheet1.get_all_records())
+        experiments_df: pd.DataFrame = self._get_experiments_df()
         now_running = False
-        for _, row in paramters_df.iterrows():
+        temp_meta = {}
+        for _, row in experiments_df.iterrows():
+            if row[NAME_ATTRIBUTE] not in ENV.current_meta["investigations"][self.name]["experiments"]:
+                ENV.current_meta["investigations"][self.name]["experiments"][row[NAME_ATTRIBUTE]] = {}
+            temp_meta[row[NAME_ATTRIBUTE]] = ENV.current_meta["investigations"][self.name]["experiments"][
+                row[NAME_ATTRIBUTE]
+            ]
             if (
                 not force_rerun
-                and ENV.current_meta["investigations"][self.name]["experiments"][row["name"]].get("status")
+                and ENV.current_meta["investigations"][self.name]["experiments"][row[NAME_ATTRIBUTE]].get("status")
                 == Task.TaskStatusEnum.completed
             ):
                 continue
-            elif ENV.current_meta["investigations"][self.name]["experiments"][row["name"]].get("status") in [
+            elif ENV.current_meta["investigations"][self.name]["experiments"][row[NAME_ATTRIBUTE]].get("status") in [
                 Task.TaskStatusEnum.in_progress,
                 Task.TaskStatusEnum.queued,
             ]:
                 continue
-            experiment_path: s3path.S3Path = self.investigation_s3_path / row["name"]
+            experiment_path: s3path.S3Path = self.investigation_s3_path / row[NAME_ATTRIBUTE]
+            command = f"python -m {row['entrypoint']} --memory-growth --clearml-queue {CLEARML_QUEUE} {'/'.join(str(experiment_path.absolute()).split('/')[4:])}"
             result = subprocess.run(
-                f"python -m {row['entrypoint']} --clearml-queue {CLEARML_QUEUE} --save-checkpoints {'/'.join(str(experiment_path.absolute()).split('/')[4:])}",
+                command,
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -132,13 +149,14 @@ class Investigation:
             now_running = True
             match = re.search(r"new task id=(.*)", result.stdout)
             clearml_id = match.group(1) if match is not None else "unknown"
-            ENV.current_meta["investigations"][self.name]["experiments"][row["name"]] = {"clearml_id": clearml_id}
+            temp_meta[row[NAME_ATTRIBUTE]]["clearml_id"] = clearml_id
+        ENV.current_meta["investigations"][self.name]["experiments"] = temp_meta
         ENV.meta.flush()
         return now_running
 
-    def sync(self):
+    def sync(self, aggregate_results=True):
         # Fetch info from clearml
-        clearml_tasks_dict: dict[str, Task] = ENV._get_clearml_tasks(self.name)
+        clearml_tasks_dict: dict[str, Union[Task, None]] = ENV._get_clearml_tasks(self.name)
         # Update gdrive, fetch
         meta_folder_id = ENV.current_meta["investigations"][self.name]["clowder_meta_yml_id"]
         remote_meta_content = yaml.safe_load(ENV._read_gdrive_file_as_string(meta_folder_id))
@@ -146,12 +164,14 @@ class Investigation:
             if "experiments" not in remote_meta_content:
                 remote_meta_content["experiments"] = {}
             for name, task in clearml_tasks_dict.items():
+                if task is None:
+                    continue
                 if name not in remote_meta_content["experiments"]:
                     remote_meta_content["experiments"][name] = {}
                 remote_meta_content["experiments"][name]["clearml_id"] = task.id
                 remote_meta_content["experiments"][name][
                     "clearml_task_url"
-                ] = f"https://app.sil.hosted.allegro.ai/projects/*/experiments/{task.id}/output/execution"
+                ] = f"https://{CLEARML_URL}/projects/*/experiments/{task.id}/output/execution"
                 remote_meta_content["experiments"][name]["status"] = task.get_status()
         ENV._write_gdrive_file_in_folder(
             self.id, "clowder.meta.yml", yaml.safe_dump(remote_meta_content), "application/x-yaml"
@@ -160,20 +180,22 @@ class Investigation:
 
         # Update locally
         for exp in ENV.current_meta["investigations"][self.name]["experiments"].keys():
+            if "experiments" not in remote_meta_content or exp not in remote_meta_content["experiments"]:
+                continue
             ENV.current_meta["investigations"][self.name]["experiments"][exp]["clearml_id"] = remote_meta_content[
                 "experiments"
             ][exp]["clearml_id"]
             ENV.current_meta["investigations"][self.name]["experiments"][exp]["clearml_task_url"] = remote_meta_content[
                 "experiments"
-            ][exp]["clearml_id"]
+            ][exp]["clearml_task_url"]
             ENV.current_meta["investigations"][self.name]["experiments"][exp]["status"] = remote_meta_content[
                 "experiments"
             ][exp]["status"]
             statuses.append(remote_meta_content["experiments"][exp]["status"])
         ENV.meta.flush()
         self.status = Status.from_clearml_task_statuses(statuses, self.status)  # type: ignore
-        if self.status == Status.Completed.value:
-            self._generate_results()
+        if self.status.value == Status.Completed.value and aggregate_results:
+            self._generate_results()  # TODO aggregate over completed experiments even if incomplete overall
         return True
 
     def _generate_results(self):
@@ -183,39 +205,69 @@ class Investigation:
         setup_df = pd.DataFrame(setup_sheet.get_all_records())
         results: dict[str, pd.DataFrame] = {}
         for _, row in setup_df.iterrows():
-            for filename in row["results-csvs"].split(";"):
-                s3_filepath: s3path.S3Path = s3path.S3Path(ENV.EXPERIMENTS_S3_FOLDER) / self.id / row["name"] / filename
+            for name in row[RESULTS_CSVS_ATTRIBUTE].split(";"):
+                name = name.strip()
+                s3_filepath: s3path.S3Path = self.investigation_s3_path / row[NAME_ATTRIBUTE] / name
                 with s3_filepath.open() as f:
                     df = pd.read_csv(StringIO(f.read()))
-                    if "scores" in filename:
-                        filename = "scores"
-                        df = self._process_scores_csv(df, row["name"])
-                    if filename not in results:
-                        results[filename] = pd.DataFrame()
-                    results[filename] = pd.concat([results[filename], df], join="outer", ignore_index=True)
+                    if "scores" in name:
+                        name = "scores"
+                        df = self._process_scores_csv(df)
+                    df.insert(0, NAME_ATTRIBUTE, [row[NAME_ATTRIBUTE]])
+                    if name not in results:
+                        results[name] = pd.DataFrame()
+                    results[name] = pd.concat([results[name], df], join="outer", ignore_index=True)
 
-        for filename, df in results.items():
+        tasks = ENV._get_clearml_tasks(self.name)
+        metrics_data = {}
+        metrics_names = set()
+        for _, row in setup_df.iterrows():
+            cur_metrics_names = set(map(lambda x: x.strip(), row[RESULTS_CLEARML_METRIC_ATTRIBUTE].split(";")))
+            metrics_names = metrics_names.union(cur_metrics_names)
+
+        metrics_names_list = list(metrics_names)
+        if len(metrics_names_list) > 0 and metrics_names_list[0] != "":
+            for index, row in setup_df.iterrows():
+                task = tasks[row[NAME_ATTRIBUTE]]
+                if task is None:
+                    continue
+                cols = [row[NAME_ATTRIBUTE]]
+                for metric in metrics_names_list:
+                    metrics = task.get_last_scalar_metrics()["Summary"]
+                    cols.append(metrics.get(metric, {"last": np.nan})["last"])
+                    metrics_data[index] = cols
+            metrics_df = pd.DataFrame.from_dict(
+                metrics_data, orient="index", columns=[NAME_ATTRIBUTE] + metrics_names_list
+            )
+            results["clearml_metrics"] = metrics_df
+
+        for name, df in results.items():
             for w in spreadsheet.worksheets():
-                if w.title == filename:
+                if w.title == name:
                     spreadsheet.del_worksheet(w)
-            s = spreadsheet.add_worksheet(filename, rows=0, cols=0)
+            s = spreadsheet.add_worksheet(name, rows=0, cols=0)
             gd.set_with_dataframe(s, df)
-            ranking_df = self._rank_fields(df)
-            for row_index, row in ranking_df.iterrows():
+            min_max_df = self._min_and_max_per_col(df)
+            for row_index, row in df.iterrows():
                 col_index = 0
                 for col in df.columns:
                     if not np.issubdtype(df.dtypes[col], np.number):
+                        col_index += 1
                         continue
                     ref = s.cell(
-                        row_index + 2, col_index + 2  # type: ignore
+                        row_index + 2, col_index + 1  # type: ignore
                     ).address  # +2 = 1 + 1 - 1 for zero- vs. one-indexed and 1 to skip column names
                     col: str
-                    r, g, b = self._color_func(row[col] / ((len(ranking_df.index)) - 1))
+                    max = min_max_df.at[col, "max"]
+                    min = min_max_df.at[col, "min"]
+                    range = max - min
+                    r, g, b = self._color_func((row[col] - min) / (range) if range != 0 else 1.0)
                     s.format(f"{ref}", {"backgroundColor": {"red": r, "green": g, "blue": b}})
 
                     col_index += 1
+                    sleep(1)  # TODO avoids exceeded per minute read quota - find better solution
 
-    def _process_scores_csv(self, df: pd.DataFrame, name: str) -> pd.DataFrame:
+    def _process_scores_csv(self, df: pd.DataFrame) -> pd.DataFrame:
         ret = df[["score"]]
         column_names = df[["scorer"]].values.flatten()
         ret = ret.transpose()
@@ -225,19 +277,15 @@ class Investigation:
         ret[["BLEU", "CHRF3", "WER", "TER", "spBLEU"]] = ret[["BLEU", "CHRF3", "WER", "TER", "spBLEU"]].apply(
             pd.to_numeric, axis=0
         )  # TODO more robust (ignore for mvp)
-        ret.insert(0, "name", [name])
         return ret
 
-    def _rank_fields(self, df: pd.DataFrame):
-        series = []
+    def _min_and_max_per_col(self, df: pd.DataFrame):
         df = df.select_dtypes(include="number")
+        ret = {}
+        col: str
         for col in df.columns:
-            srtd = df.sort_values(by=col)
-            s = srtd.index
-            series.append(s)
-        ret = pd.DataFrame(series).transpose()
-        ret.columns = df.columns
-        return ret
+            ret[col] = [df[col].max(), df[col].min()]
+        return pd.DataFrame.from_dict(ret, orient="index", columns=["max", "min"])
 
     def _color_func(self, x: float) -> tuple:
         if x > 0.5:
@@ -250,17 +298,36 @@ class Investigation:
             if task is not None:
                 task.mark_stopped(status_message="Task was stopped by user")
 
-    def delete(self, delete_from_clearml: bool = True, delete_from_gdrive: bool = True):
+    def delete(self, delete_from_clearml: bool = True, delete_from_gdrive: bool = True, delete_from_s3: bool = True):
         if delete_from_clearml:
-            for _, obj in ENV.current_meta["investigations"][self.name]["experiments"].items():
-                task: Optional[Task] = Task.get_task(task_id=obj["clearml_id"])
-                if task is not None:
-                    task.delete()
+            try:
+                for _, obj in ENV.current_meta["investigations"][self.name].get("experiments", {}).items():
+                    task: Optional[Task] = Task.get_task(task_id=obj["clearml_id"])
+                    if task is not None:
+                        task.delete()
+            except:
+                print(f"Failed to delete investigation {self.name} from ClearML")
         if delete_from_gdrive:
-            ENV._delete_gdrive_folder(self.id)
+            try:
+                ENV._delete_gdrive_folder(self.id)
+            except:
+                print(f"Failed to delete investigation {self.name} from Google Drive")
+        if delete_from_s3:
+            try:
+                ENV._delete_s3_folder(self.investigation_s3_path)
+            except:
+                print(f"Failed to delete investigation {self.name} from the S3 bucket")
+
         del ENV.current_meta["investigations"][self.name]
         ENV.meta.flush()
         self = None
+
+    def import_setup_from(self, other):
+        other_sheet_df = other._get_experiments_df()
+        sheet = ENV.gc.open_by_key(self.sheet_id).sheet1
+        gd.set_with_dataframe(sheet, other_sheet_df)
+        config_data = ENV._read_gdrive_file_as_string(ENV._dict_of_gdrive_files(other.id)["config.yml"]["id"])
+        ENV._write_gdrive_file_in_folder(self.id, "config.yml", config_data, "application/x-yaml")
 
     @staticmethod
     def from_meta(data: dict):
@@ -305,7 +372,7 @@ class Environment:
             self._get_env_var("GOOGLE_CREDENTIALS_FILE")
             if os.environ.get("GOOGLE_CREDENTIALS_FILE") is not None
             else "../.clowder/"
-            + list(filter(lambda p: "clowder" in p and ".json" in p, os.listdir("../.clowder/")))[0]  # TODO
+            + list(filter(lambda p: "clowder" in p and ".json" in p, os.listdir("../.clowder/")))[0]  # TODO more robust
         )
         self.EXPERIMENTS_S3_FOLDER = (
             "/aqua-ml-data/MT/experiments/clowder/"  # self._get_env_var("EXPERIMENTS_S3_FOLDER")
@@ -354,6 +421,10 @@ class Environment:
         clowder_log_id = self._write_gdrive_file_in_folder(folder_id, "clowder.log", "")
         clowder_config_yml_id = self._write_gdrive_file_in_folder(folder_id, "config.yml", "", "application/x-yaml")
         sheet = self.gc.create("investigation", folder_id)
+        df: pd.DataFrame = pd.DataFrame(
+            columns=[NAME_ATTRIBUTE, ENTRYPOINT_ATTRIBUTE, RESULTS_CSVS_ATTRIBUTE, RESULTS_CLEARML_METRIC_ATTRIBUTE]
+        )
+        gd.set_with_dataframe(sheet.sheet1, df)
         sheet.sheet1.update_title("ExperimentsSetup")
         sheet_id = sheet.id
         experiments_folder_id = self._create_gdrive_folder("experiments", folder_id)
@@ -382,13 +453,16 @@ class Environment:
         ENV.add_investigation(investigation_name, investigation_data)
         return ENV.get_investigation(investigation_name)
 
-    def _get_clearml_tasks(self, investigation_name: str):
+    def _get_clearml_tasks(self, investigation_name: str) -> "dict[str, Union[None,Task]]":
         if "experiments" not in self.current_meta["investigations"][investigation_name]:
             self.current_meta["investigations"][investigation_name]["experiments"] = {}
         experiments = self.current_meta["investigations"][investigation_name]["experiments"]
         tasks = {}
         for experiment_name, obj in experiments.items():
-            task: Optional[Task] = Task.get_task(task_id=obj["clearml_id"])
+            clearml_id = obj["clearml_id"]
+            if clearml_id is None or clearml_id == "unknown":
+                continue
+            task: Optional[Task] = Task.get_task(task_id=clearml_id)
             tasks[experiment_name] = task
         return tasks
 
@@ -441,10 +515,11 @@ class Environment:
     def _read_gdrive_file_as_bytes(self, file_id: str) -> bytes:
         file = self._google_drive.CreateFile({"id": file_id})
         buffer: MediaIoReadable = file.GetContentIOBuffer()
-        return buffer.read()  # type: ignore
+        b = buffer.read()
+        return b if b is not None else b""  # type: ignore
 
     def _write_gdrive_file_in_folder(
-        self, parent_folder_id: str, file_name: str, content: str, file_type: Optional[str] = None
+        self, parent_folder_id: str, file_name: str, content: Union[str, bytes], file_type: Optional[str] = None
     ) -> str:
         files = self._dict_of_gdrive_files(parent_folder_id)
         if file_name in files:
@@ -471,9 +546,7 @@ class Environment:
     def _create_gdrive_folder(self, folder_name: str, parent_folder_id: str) -> str:
         files = self._dict_of_gdrive_files(parent_folder_id)
         if folder_name in files:
-            # Do nothing - return the existing folder id
             return files[folder_name]["id"]
-        # create a new folder
         fh = self._google_drive.CreateFile(
             {
                 "title": folder_name,
@@ -536,12 +609,13 @@ class Environment:
             investigation_name,
             {
                 "id": folder_id,
-                "status": remote_meta["status"],
+                "status": remote_meta.get("status", "Created"),
                 "experiments_folder_id": experiments_folder_id,
                 "clowder_meta_yml_id": meta_file["id"],
                 "clowder_log_id": clowder_log_id,
                 "clowder_config_yml_id": clowder_config_yml_id,
                 "sheet_id": sheet_id,
+                "experiments": remote_meta.get("experiments", {}),
             },
         )
 
@@ -555,7 +629,7 @@ class Environment:
 
     # TODO types!
 
-    def log(self, investigation_name: str, data: str):  # TODO
+    def log(self, investigation_name: str, data: str):
         current_log = self._read_gdrive_file_as_string(
             self.current_meta["investigation"][investigation_name]["clowder_log_id"]
         )
@@ -575,7 +649,20 @@ class Environment:
                 self._copy_gdrive_folder_to_s3(file["id"], s3_file)
             else:
                 with s3_file.open("wb") as f:
-                    f.write(self._read_gdrive_file_as_bytes(file["id"]))
+                    data = self._read_gdrive_file_as_bytes(file["id"])
+                    # print(data.decode("utf-8"))
+                    f.write(data)
+
+    def _delete_s3_file(self, s3_path: s3path.S3Path):
+        s3_path.unlink(missing_ok=True)
+
+    def _delete_s3_folder(self, s3_path: s3path.S3Path):
+        for child in s3_path.iterdir():
+            if child.is_dir():
+                self._delete_s3_folder(child)
+            else:
+                self._delete_s3_file(child)
+        s3_path.rmdir()
 
 
 ENV = Environment()

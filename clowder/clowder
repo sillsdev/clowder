@@ -25,14 +25,14 @@ def track(investigation_name: Optional[str] = None):
     print(functions.track(investigation_name))
 
 
-@app.command("duplicate")
+@app.command("create-from-template")
 def duplicate(from_investigation_name: str, new_investigation_name: str):
-    print(functions.duplicate(from_investigation_name, new_investigation_name))
+    print(functions.create_from_template(from_investigation_name, new_investigation_name))
 
 
 @app.command("delete")
-def delete(investigation_name: str, keep_clearml: bool = False, keep_google_drive: bool = False):
-    print(functions.delete(investigation_name, not keep_clearml, not keep_google_drive))
+def delete(investigation_name: str, keep_clearml: bool = False, keep_google_drive: bool = False, keep_s3: bool = False):
+    functions.delete(investigation_name, not keep_clearml, not keep_google_drive, not keep_s3)
 
 
 @app.command("urlfor")
@@ -47,7 +47,7 @@ def idfor(investigation_name: str):
 
 @app.command("cancel")
 def cancel(investigation_name: str):
-    print(functions.cancel(investigation_name))
+    functions.cancel(investigation_name)
 
 
 @app.command("run")
@@ -56,10 +56,20 @@ def run(investigation_name: str, force_rerun: bool = False):
 
 
 @app.command("status")
-def status(investigation_name: Optional[str] = None, sync: bool = True):
-    for inv_name, status in functions.status(investigation_name, sync).items():
-        color = _map_status_color(status)
-        print(inv_name, f"[{color}]{status.value}[/{color}]")
+def status(investigation_name: Optional[str] = None, sync: bool = True, verbose: bool = False):
+    for inv_name, obj in functions.status(investigation_name, sync).items():
+        color = _map_status_color(obj["status"])
+        if verbose:
+            print(f"[bold]{inv_name}[/bold]")
+            print(f"\tStatus:[{color}]\t{obj['status'].value}[/{color}]")
+            print(f"\tGDrive url:\t{obj['gdrive_url']}")
+            print(f"\tExperiments:")
+            for exp_name, exp_obj in obj["experiments"].items():
+                print(f"\t[bold]{exp_name}[/bold]")
+                print(f"\tStatus:\t{exp_obj['status']}")
+                print(f"\tClearML url:\t{exp_obj['clearml_task_url']}")
+        else:
+            print(inv_name, f"[{color}]\t{obj['status'].value}[/{color}]")
 
 
 @app.command("sync")
@@ -91,6 +101,11 @@ def list():
 @app.command("current-context")
 def current_context():
     print(functions.current_context())
+
+
+@app.command("init")
+def init():
+    functions.init()
 
 
 def _map_status_color(status: Status) -> str:
