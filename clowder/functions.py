@@ -1,8 +1,6 @@
 from typing import Optional
-from clowder.environment import ENV, Investigation, DuplicateExperimentException
+from clowder.environment import ENV, Investigation, DuplicateExperimentException, Environment
 from clowder.status import Status
-import yaml
-
 
 # TODO remote logging (ignore for mvp)
 
@@ -59,7 +57,7 @@ def cancel(investigation_name: str):
 
 
 def run(investigation_name: str, force_rerun: bool = False) -> bool:
-    sync(investigation_name, aggregate_results=False)
+    sync(investigation_name, gather_results=False)
     investigation = ENV.get_investigation(investigation_name)
     if investigation.status.value == Status.Running.value:
         return False
@@ -90,12 +88,12 @@ def status(investigation_name: Optional[str], _sync: bool = True) -> dict:
     }
 
 
-def sync(investigation_name: Optional[str], aggregate_results: bool = True):
+def sync(investigation_name: Optional[str], gather_results: bool = True):
     if investigation_name is not None:
-        ENV.get_investigation(investigation_name).sync(aggregate_results=aggregate_results)
+        ENV.get_investigation(investigation_name).sync(gather_results=gather_results)
     else:
         for investigation in ENV.investigations:
-            investigation.sync(aggregate_results=aggregate_results)
+            investigation.sync(gather_results=gather_results)
 
 
 def create(investigation_name: str):
@@ -118,8 +116,3 @@ def list_inv() -> "list[Investigation]":
 
 def current_context() -> str:
     return ENV.root
-
-
-def init():
-    ENV.meta.data = {"temp": {"investigations": {}}, "current_root": "temp"}
-    ENV.meta.flush()

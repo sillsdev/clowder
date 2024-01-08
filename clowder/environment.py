@@ -25,8 +25,8 @@ import numpy as np
 from gspread import Worksheet
 import gspread_dataframe as gd
 from status import Status
-from pprint import pprint
 from time import sleep
+from tqdm import tqdm
 
 GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 CLEARML_QUEUE = "jobs_backlog"
@@ -154,7 +154,7 @@ class Investigation:
         ENV.meta.flush()
         return now_running
 
-    def sync(self, aggregate_results=True):
+    def sync(self, gather_results=True):
         # Fetch info from clearml
         clearml_tasks_dict: dict[str, Union[Task, None]] = ENV._get_clearml_tasks(self.name)
         # Update gdrive, fetch
@@ -194,8 +194,13 @@ class Investigation:
             statuses.append(remote_meta_content["experiments"][exp]["status"])
         ENV.meta.flush()
         self.status = Status.from_clearml_task_statuses(statuses, self.status)  # type: ignore
-        if self.status.value == Status.Completed.value and aggregate_results:
-            self._generate_results()  # TODO aggregate over completed experiments even if incomplete overall
+        if self.status == Status.Completed:
+            print(f"Investigation {self.name} is complete!")
+            if gather_results:
+                print("Results of investigation must be collected. This may take a while.")
+                self._generate_results()  # TODO aggregate over completed experiments even if incomplete overall
+            else:
+                print("In order to see results, rerun with gather_results set to True.")
         return True
 
     def _generate_results(self):
@@ -204,10 +209,17 @@ class Investigation:
         setup_sheet: Worksheet = list(filter(lambda s: s.title == "ExperimentsSetup", worksheets))[0]
         setup_df = pd.DataFrame(setup_sheet.get_all_records())
         results: dict[str, pd.DataFrame] = {}
-        for _, row in setup_df.iterrows():
+        experiment_folders = ENV._dict_of_gdrive_files(self.experiments_folder_id)
+        print("Copying over results...")
+        for _, row in tqdm(setup_df.iterrows()):
+            ENV._copy_s3_folder_to_gdrive(
+                self.investigation_s3_path / row[NAME_ATTRIBUTE], experiment_folders[row[NAME_ATTRIBUTE]]["id"]
+            )
             for name in row[RESULTS_CSVS_ATTRIBUTE].split(";"):
                 name = name.strip()
-                s3_filepath: s3path.S3Path = self.investigation_s3_path / row[NAME_ATTRIBUTE] / name
+                s3_filepath: s3path.S3Path = (
+                    self.investigation_s3_path / row[NAME_ATTRIBUTE] / name
+                )  # TODO - use result that's already been copied over to gdrive
                 with s3_filepath.open() as f:
                     df = pd.read_csv(StringIO(f.read()))
                     if "scores" in name:
@@ -241,7 +253,8 @@ class Investigation:
             )
             results["clearml_metrics"] = metrics_df
 
-        for name, df in results.items():
+        print("Processing results data...")
+        for name, df in tqdm(results.items()):
             for w in spreadsheet.worksheets():
                 if w.title == name:
                     spreadsheet.del_worksheet(w)
@@ -344,9 +357,6 @@ class Investigation:
         )
 
 
-# TODO copy results into gdrvie - link
-
-
 class InvestigationNotFoundError(Exception):
     """No such investigation in the current context"""
 
@@ -354,7 +364,13 @@ class InvestigationNotFoundError(Exception):
 class ClowderMeta:
     def __init__(self, meta_filepath: str) -> None:
         self.filepath = meta_filepath
-        with open(meta_filepath, "r") as f:
+        if not Path.exists(Path("..", ".clowder")):
+            os.mkdir("../.clowder")
+        if not Path.is_file(Path(self.filepath)):
+            data = {"temp": {"investigations": {}}, "current_root": "temp"}
+            with open(self.filepath, "w") as f:
+                yaml.safe_dump(data, f)
+        with open(self.filepath, "r") as f:
             self.data: Any = yaml.safe_load(f)
 
     def flush(self):
@@ -368,12 +384,17 @@ class Environment:
     def __init__(self):
         self.meta = ClowderMeta("../.clowder/clowder.master.meta.yml")
         self.INVESTIGATIONS_GDRIVE_FOLDER = self.root
-        self.GOOGLE_CREDENTIALS_FILE = (
-            self._get_env_var("GOOGLE_CREDENTIALS_FILE")
-            if os.environ.get("GOOGLE_CREDENTIALS_FILE") is not None
-            else "../.clowder/"
-            + list(filter(lambda p: "clowder" in p and ".json" in p, os.listdir("../.clowder/")))[0]  # TODO more robust
-        )
+        try:
+            self.GOOGLE_CREDENTIALS_FILE = (
+                self._get_env_var("GOOGLE_CREDENTIALS_FILE")
+                if os.environ.get("GOOGLE_CREDENTIALS_FILE") is not None
+                else "../.clowder/"
+                + list(filter(lambda p: "clowder" in p and ".json" in p, os.listdir("../.clowder/")))[
+                    0
+                ]  # TODO more robust
+            )
+        except IndexError:
+            raise MissingConfigurationFile("No google credentials file found in .clowder directory")
         self.EXPERIMENTS_S3_FOLDER = (
             "/aqua-ml-data/MT/experiments/clowder/"  # self._get_env_var("EXPERIMENTS_S3_FOLDER")
         )
@@ -652,6 +673,18 @@ class Environment:
                     data = self._read_gdrive_file_as_bytes(file["id"])
                     # print(data.decode("utf-8"))
                     f.write(data)
+
+    def _copy_s3_folder_to_gdrive(self, s3_path: s3path.S3Path, folder_id: str):
+        for file in s3_path.iterdir():
+            if file.is_dir():
+                id = self._create_gdrive_folder(file.name, folder_id)
+                self._copy_s3_folder_to_gdrive(file, id)
+            else:
+                try:
+                    with file.open("r") as f:
+                        self._write_gdrive_file_in_folder(folder_id, file.name, f.read())
+                except:
+                    print(f"Failed to copy file {file.name} to GDrive folder {folder_id}")
 
     def _delete_s3_file(self, s3_path: s3path.S3Path):
         s3_path.unlink(missing_ok=True)
